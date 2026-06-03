@@ -1,217 +1,235 @@
-# Pipeline de Selección de Variables para Regresión con XGBoost
+# Feature Selection Pipeline for Regression with XGBoost
 
-**Contexto del problema**
+**Problem context**
 
-- Tarea: regresión, modelo final XGBoost.
-- Datos: `df_train`, **≤ 10 000 filas**. Todas las decisiones de selección se toman **únicamente sobre `df_train`**; el conjunto de test permanece intacto hasta el final.
-- Las fases se ejecutan **en cadena**, una tras otra: la salida (lista de features) de una fase es la entrada de la siguiente.
-- Boruta se usa en su variante **Boruta-SHAP** (importancias SHAP en lugar de *gain*).
+- Task: regression, final model XGBoost.
+- Data: `df_train`, **≤ 10,000 rows**. All selection decisions are made **only on `df_train`**; the test set stays untouched until the very end.
+- Phases run **in a chain**, one after another: the output (feature list) of one phase is the input of the next.
+- Boruta is used in its **Boruta-SHAP** variant (SHAP importances instead of *gain*).
 
-**Decisión transversal: un único estimador (XGBoost), no LightGBM**
+**Cross-cutting decision: a single estimator (XGBoost), not LightGBM**
 
-Con ≤ 10 000 filas la velocidad no es un factor. XGBoost con `tree_method="hist"` ya usa el mismo algoritmo de histograma que motivaba a LightGBM. Mezclar dos estimadores introduce un *selection–model mismatch*: seleccionarías variables según el sesgo inductivo de LightGBM (binning propio, crecimiento *leaf-wise*, manejo distinto de interacciones y NaN) para luego entrenar XGBoost. Se selecciona **para** XGBoost, así que se selecciona **con** XGBoost.
-
----
-
-## Mapa de las fases y qué controla cada una
-
-| Fase | Método | Pregunta que responde | Tipo de selección | ¿Overfitting train/val es el riesgo clave? |
-|------|--------|-----------------------|-------------------|--------------------------------------------|
-| 1 | Spearman (umbral 0.85) | ¿Qué features son redundantes entre sí? | Filtro, *model-agnostic* | **No** — no ajusta modelo |
-| 2 | Boruta-SHAP | ¿Qué features baten al ruido? | *All-relevant* (incluyente) | **No** — control por *shadows* |
-| 3 | Stability selection | ¿Qué features se eligen de forma consistente? | Robustez por remuestreo | **No** — el remuestreo es el control |
-| 4 | Backward selection (XGBoost) | ¿Cuál es el subconjunto mínimo óptimo? | *Minimal-optimal*, específico del modelo | **Sí — es el riesgo dominante** |
-| 5 *(añadida)* | Baseline check | ¿La selección mejora/iguala usar todo? | Validación de sanidad | Sí, por CV |
-
-La progresión es correcta: **barato → caro**, **agnóstico → específico del modelo**, **incluyente (all-relevant) → mínimo (minimal-optimal)**.
+With ≤ 10,000 rows speed is not a factor. XGBoost with `tree_method="hist"` already uses the same histogram algorithm that motivated LightGBM. Mixing two estimators introduces a *selection–model mismatch*: you would select variables according to LightGBM's inductive bias (its own binning, *leaf-wise* growth, different handling of interactions and NaNs) and then train XGBoost. You select **for** XGBoost, so you select **with** XGBoost.
 
 ---
 
-## Fase 1 — Correlación de Spearman (umbral 0.85)
+## Phase map — what each phase controls
 
-### Qué hace el método
+The "Selection-method family" column follows the taxonomy of Kuhn & Johnson (*Feature Engineering and Selection*, https://feat.engineering/): **Filter / Wrapper / Embedded (intrinsic)**, plus **Hybrid/iterative** and **Dimensionality reduction**. Filters analyze predictors once and pass the survivors on; wrappers iteratively search subsets guided by model performance; embedded/intrinsic methods select during model training (tree-based models qualify).
 
-Spearman mide la **correlación de rangos**: en lugar de operar sobre los valores, opera sobre sus posiciones ordenadas. Captura cualquier relación **monótona** (no solo lineal), por eso es robusta a transformaciones monótonas y a *outliers*.
+| Phase | Method | Selection-method family (Kuhn & Johnson) | Question it answers | Selection scope | Is train/val overfitting the key risk? |
+|------|--------|------------------------------------------|---------------------|-----------------|-----------------------------------------|
+| 1 | Spearman (threshold 0.85) | **Filter** — unsupervised, feature-vs-feature (high-correlation pruning) | Which features are redundant with each other? | Model-agnostic | **No** — fits no model |
+| 2 | Boruta-SHAP | **Embedded / intrinsic** — tree-based importance + shadow test (all-relevant) | Which features beat noise? | All-relevant (inclusive) | **No** — controlled by *shadows* |
+| 3 | Stability selection | **Hybrid / iterative** — resampling wrapped around an embedded base learner | Which features are selected consistently? | Robustness via resampling | **No** — resampling is the control |
+| 4 | Backward selection (XGBoost) | **Wrapper** — greedy sequential backward elimination (SBS) | What is the minimal optimal subset? | Minimal-optimal, model-specific | **Yes — the dominant risk** |
+| 5 *(added)* | Baseline check | *Validation / diagnostic* (not a selection family) | Does selection beat/match using everything? | Sanity check, via CV | Yes, via CV |
 
-Definición (sin empates):
+The progression is sound: **cheap → expensive**, **agnostic → model-specific**, **inclusive (all-relevant) → minimal (minimal-optimal)**. Note it also walks the Kuhn & Johnson families in increasing model-dependence: filter → embedded → hybrid → wrapper.
+
+---
+
+## Phase 1 — Spearman correlation (threshold 0.85)
+
+### What the method does
+
+Spearman measures **rank correlation**: instead of operating on the values, it operates on their sorted positions. It captures any **monotonic** relationship (not just linear), which makes it robust to monotonic transforms and to outliers.
+
+Definition (no ties):
 
 ```
 ρ = 1 − 6·Σ dᵢ² / (n·(n²−1))
 ```
 
-donde `dᵢ` es la diferencia de rangos del par de observaciones `i`. Equivale a la correlación de Pearson aplicada sobre los rangos.
+where `dᵢ` is the rank difference of observation pair `i`. It is equivalent to Pearson correlation computed on the ranks.
 
-### Cómo se aplica aquí
+### Family classification
 
-- Se calcula la matriz `|ρ|` **feature–feature** (no feature–target).
-- Para cada par con `|ρ| ≥ 0.85` se conserva **una** feature y se descarta la otra: son redundantes para un modelo.
-- "Sin inferir null": no se hace test de significancia del coeficiente; se usa el umbral de magnitud directamente. Correcto, porque aquí no interesa si la correlación es "estadísticamente distinta de 0", sino si es **prácticamente alta**.
+**Filter, unsupervised (feature-vs-feature).** In the Kuhn & Johnson taxonomy this is a filter step — a one-time statistical analysis of the predictors, here unsupervised because it looks only at feature–feature redundancy, not at the target. It corresponds to "high pairwise correlation pruning".
 
-### Análisis crítico de overfitting
+### How it is applied here
 
-**No hay overfitting posible**: no se ajusta ningún modelo, no hay train ni validación. Spearman es una propiedad de la distribución conjunta de los datos. La métrica train/val no aplica.
+- Compute the **feature–feature** `|ρ|` matrix (not feature–target).
+- For each pair with `|ρ| ≥ 0.85`, keep **one** feature and drop the other: they are redundant for the model.
+- "Without inferring null": no significance test on the coefficient; the magnitude threshold is used directly. Correct, because here we don't care whether the correlation is "statistically different from 0" but whether it is **practically high**.
 
-### Crítica al diseño y ajustes recomendados
+### Overfitting analysis
 
-- **Los árboles toleran colinealidad.** XGBoost no necesita decorrelación como un modelo lineal: ante dos features correladas simplemente elige una en el split. Por tanto, el valor real de esta fase **no** es "ayudar a XGBoost a converger", sino **estabilizar las fases 2 y 3**: cuando dos features están muy correladas, se reparten la importancia (SHAP o frecuencia de selección), lo que diluye la señal y puede hacer que ambas parezcan débiles en Boruta y stability.
-- **Tie-break informado, no aleatorio.** Al decidir cuál del par conservar, no elegir al azar. Criterios razonables: mayor `|ρ_Spearman|` con el target, menor % de NaN, o menor cardinalidad/coste. Documentar la regla.
-- **Riesgo real:** descartar una feature que individualmente era más predictiva. Por eso 0.85 es un umbral prudente (alto): solo elimina redundancia casi-total.
+**No overfitting is possible**: no model is fit, there is no train or validation. Spearman is a property of the joint distribution of the data. The train/val metric does not apply.
 
-**Veredicto:** se mantiene, pero entendiendo que su justificación es *estabilizar las fases de importancia downstream*, no una necesidad del modelo final.
+### Design critique and recommended adjustments
 
----
+- **Trees tolerate collinearity.** XGBoost does not need decorrelation the way a linear model does: facing two correlated features it simply picks one at the split. So the real value of this phase is **not** "helping XGBoost converge" but **stabilizing phases 2 and 3**: when two features are highly correlated, they split the importance (SHAP or selection frequency), which dilutes the signal and can make both look weak in Boruta and stability.
+- **Informed tie-break, not random.** When deciding which of the pair to keep, do not pick at random. Reasonable criteria: higher `|ρ_Spearman|` with the target, fewer NaNs, or lower cardinality/cost. Document the rule.
+- **Real risk:** discarding a feature that was individually more predictive. That is why 0.85 is a prudent (high) threshold: it only removes near-total redundancy.
 
-## Fase 2 — Boruta-SHAP (guardar Confirmadas + Tentativas)
-
-### Qué hace el método
-
-Boruta es un método de selección **all-relevant**: busca **todas** las features con señal real, no el subconjunto mínimo. Mecánica:
-
-1. Por cada feature real, crea una **shadow feature**: una copia con sus valores **permutados aleatoriamente**. Por construcción, la shadow no tiene relación con el target (es ruido con la misma distribución marginal).
-2. Entrena el modelo (aquí XGBoost) sobre features reales + shadows.
-3. Calcula importancias. En **Boruta-SHAP** se usan **valores SHAP** en vez de *gain*: SHAP atribuye a cada feature su contribución marginal promediada sobre coaliciones, lo que da importancias más consistentes y menos sesgadas hacia features de alta cardinalidad que el *gain*.
-4. Una feature recibe un **"hit"** en esa iteración si su importancia supera el **máximo** de las importancias de **todas** las shadows.
-5. Se repite muchas iteraciones. El número de hits de cada feature sigue, bajo la hipótesis nula de irrelevancia, una **binomial(n_iter, 0.5)**. Se aplica un test:
-   - **Confirmada:** hits significativamente **por encima** de lo esperado por azar.
-   - **Rechazada:** hits significativamente **por debajo**.
-   - **Tentativa (indecisa):** ni una cosa ni la otra → señal ambigua.
-
-### Por qué guardar Confirmadas + Tentativas
-
-En esta fase conviene ser **incluyente**: es un colador ancho. Las features tentativas pueden tener señal débil o inestable que las fases 3 y 4 evaluarán mejor. Descartarlas aquí sería podar demasiado pronto.
-
-### Análisis crítico de overfitting
-
-**El gap train/val no es la lente relevante.** La lógica de Boruta es **autorreferencial**: compara cada feature contra ruido (shadows) entrenado en el **mismo** ajuste. Si el modelo sobreajusta e infla importancias, **también infla las de las shadows** (que son ruido con la misma distribución), de modo que la comparación relativa se mantiene válida. Un modelo moderadamente sobreajustado no rompe Boruta.
-
-Matiz: las importancias SHAP calculadas **sobre las filas de train** reflejan cómo el modelo *ajustó* train, y un modelo muy sobreajustado puede sobre-acreditar features ruidosas a las que se "enganchó". El control de shadows compensa parcialmente esto, pero no del todo.
-
-**Mitigaciones (preferibles a un split train/val explícito dentro de Boruta):**
-- Mantener el estimador **regularizado** (el `xgb_fast` con `min_child_weight` moderado, `subsample`/`colsample` < 1).
-- Calcular SHAP **out-of-fold** (sobre filas no usadas en ese ajuste) si se quiere robustez extra.
-
-**Veredicto:** se mantiene tal cual. No añadiría un split train/val "para mirar overfitting" porque el mecanismo de shadows ya cumple esa función; sí mantendría regularización y consideraría SHAP OOF.
+**Verdict:** keep it, understanding its justification is *stabilizing the downstream importance phases*, not a need of the final model.
 
 ---
 
-## Fase 3 — Stability Selection (umbral 0.7)
+## Phase 2 — Boruta-SHAP (keep Confirmed + Tentative)
 
-### Qué hace el método
+### What the method does
 
-Stability selection (Meinshausen & Bühlmann) ataca un problema distinto al de Boruta: **¿la selección es estable ante pequeñas perturbaciones de los datos?** Una feature puede batir al ruido en un ajuste concreto pero ser elegida de forma errática según qué filas entren.
+Boruta is an **all-relevant** selection method: it looks for **all** features with real signal, not the minimal subset. Mechanics:
 
-Mecánica:
+1. For each real feature, create a **shadow feature**: a copy with its values **randomly permuted**. By construction the shadow has no relationship with the target (it is noise with the same marginal distribution).
+2. Train the model (here XGBoost) on real features + shadows.
+3. Compute importances. In **Boruta-SHAP**, **SHAP values** are used instead of *gain*: SHAP attributes to each feature its marginal contribution averaged over coalitions, giving more consistent importances that are less biased toward high-cardinality features than *gain*.
+4. A feature gets a **"hit"** in that iteration if its importance exceeds the **maximum** importance among **all** shadows.
+5. Repeat over many iterations. Under the null hypothesis of irrelevance, the number of hits per feature follows a **Binomial(n_iter, 0.5)**. A test is applied:
+   - **Confirmed:** hits significantly **above** chance.
+   - **Rejected:** hits significantly **below**.
+   - **Tentative (undecided):** neither → ambiguous signal.
 
-1. Se generan `B` submuestras de `df_train` (típicamente submuestreo del 50% sin reemplazo, o *bootstrap*).
-2. En cada submuestra se ajusta el modelo y se determina un **conjunto seleccionado** (p. ej. top-*k* por importancia, o importancia SHAP > 0). Es necesario **definir explícitamente** esta regla de selección por submuestra.
-3. Para cada feature `k` se calcula su **frecuencia de selección**:
+### Family classification
+
+**Embedded / intrinsic.** Boruta is built on the model's own (intrinsic) importance: tree-based models perform selection during training, and Boruta wraps that intrinsic importance with a shadow-feature significance test. In the Kuhn & Johnson scheme it sits with tree-based importance methods, extended into an all-relevant selector.
+
+### Why keep Confirmed + Tentative
+
+At this phase it pays to be **inclusive**: it is a wide sieve. Tentative features may carry weak or unstable signal that phases 3 and 4 will judge better. Dropping them here would prune too early.
+
+### Overfitting analysis
+
+**The train/val gap is not the relevant lens.** Boruta's logic is **self-referential**: it compares each feature against noise (shadows) trained in the **same** fit. If the model overfits and inflates importances, **it also inflates the shadows'** (which are noise with the same distribution), so the relative comparison stays valid. A moderately overfit model does not break Boruta.
+
+Nuance: SHAP importances computed **on the train rows** reflect how the model *fit* train, and a heavily overfit model can over-credit noisy features it latched onto. The shadow control partially compensates, but not fully.
+
+**Mitigations (preferable to an explicit train/val split inside Boruta):**
+- Keep the estimator **regularized** (the `xgb_fast` with moderate `min_child_weight`, `subsample`/`colsample` < 1).
+- Compute SHAP **out-of-fold** (on rows not used in that fit) for extra robustness.
+
+**Verdict:** keep as is. I would not add a train/val split "to watch overfitting" because the shadow mechanism already serves that role; I would keep regularization and consider OOF SHAP.
+
+---
+
+## Phase 3 — Stability selection (threshold 0.7)
+
+### What the method does
+
+Stability selection (Meinshausen & Bühlmann) attacks a different problem from Boruta: **is the selection stable under small perturbations of the data?** A feature can beat noise in one fit yet be picked erratically depending on which rows enter.
+
+Mechanics:
+
+1. Generate `B` subsamples of `df_train` (typically 50% subsampling without replacement, or *bootstrap*).
+2. On each subsample fit the model and determine a **selected set** (e.g. top-*k* by importance, or SHAP importance > 0). The **per-subsample selection rule must be defined explicitly**.
+3. For each feature `k`, compute its **selection frequency**:
 
 ```
-Π_k = (1/B) · Σ_b  1[ feature k seleccionada en la submuestra b ]
+Π_k = (1/B) · Σ_b  1[ feature k selected in subsample b ]
 ```
 
-4. Se conservan las features con `Π_k ≥ π_thr`, aquí **0.7**.
+4. Keep features with `Π_k ≥ π_thr`, here **0.7**.
 
-### Garantía teórica
+### Family classification
 
-Con `π_thr > 0.5`, el método acota el número esperado de falsos positivos:
+**Hybrid / iterative.** Stability selection sits among the hybrid/iterative methods: it wraps an embedded base learner (here tree importance) inside a resampling loop and retains features chosen above a frequency threshold. It is neither a pure filter nor a single-pass wrapper — it combines resampling robustness with embedded importances.
+
+### Theoretical guarantee
+
+With `π_thr > 0.5`, the method bounds the expected number of false positives:
 
 ```
 E[V] ≤ (1 / (2·π_thr − 1)) · q² / p
 ```
 
-donde `q` = nº medio de features seleccionadas por submuestra y `p` = total de features candidatas. Esto exige `π_thr > 0.5`; **0.7 es una elección sólida** (control de falsos positivos sin ser excesivamente conservador).
+where `q` = mean number of features selected per subsample and `p` = total candidate features. This requires `π_thr > 0.5`; **0.7 is a solid choice** (false-positive control without being overly conservative).
 
-### Análisis crítico de overfitting
+### Overfitting analysis
 
-**El remuestreo *es* el control de varianza/overfitting.** Solo se usa la salida **binaria** "¿fue seleccionada en esta submuestra?". Las selecciones impulsadas por ruido aparecen de forma intermitente y no superan el umbral; las features con señal real reaparecen consistentemente. Vigilar el gap train/val dentro de cada ajuste es **redundante** con lo que la fase ya hace por diseño: la frecuencia entre submuestras *es* el proxy de generalización de la decisión de selección.
+**Resampling *is* the variance/overfitting control.** Only the **binary** output "was it selected in this subsample?" is used. Noise-driven selections appear intermittently and fail to clear the threshold; truly informative features reappear consistently. Watching the train/val gap inside each fit is **redundant** with what the phase already does by design: the cross-subsample frequency *is* the generalization proxy of the selection decision.
 
-Los parámetros a vigilar no son train/val sino: `B` (suficientes submuestras, p. ej. 50–100), `q` (tamaño de selección por submuestra) y `π_thr`.
+The parameters to watch are not train/val but: `B` (enough subsamples, e.g. 50–100), `q` (selection size per subsample) and `π_thr`.
 
-### Crítica al diseño
+### Design critique
 
-- **Redundancia parcial con Boruta.** Ambas son filtros basados en importancia de árboles. La diferencia clave: Boruta responde "¿supera al ruido?" y stability responde "¿se elige de forma consistente?". Una feature puede pasar Boruta y ser inestable → stability **sí aporta** información nueva, pero la solapación es real.
-- **Mitigación de coste y solapamiento:** ejecutar stability **sobre el set ya reducido por Boruta** (como en esta cadena) la hace barata y la convierte en un filtro de robustez, no en un re-descubrimiento desde cero. Correcto.
-- **Definir la regla de selección por submuestra** es imprescindible y a menudo se omite. Recomendado: top-*k* por SHAP, con *k* coherente con `q` de la fórmula anterior.
+- **Partial redundancy with Boruta.** Both are tree-importance-based filters. The key difference: Boruta answers "does it beat noise?" and stability answers "is it selected consistently?". A feature can pass Boruta and be unstable → stability **does** add new information, but the overlap is real.
+- **Cost and overlap mitigation:** run stability **on the Boruta-reduced set** (as in this chain), which makes it cheap and turns it into a robustness filter rather than a from-scratch rediscovery. Correct.
+- **Defining the per-subsample selection rule** is essential and often omitted. Recommended: top-*k* by SHAP, with *k* consistent with the `q` in the formula above.
 
-**Veredicto:** se mantiene, ejecutada barata sobre el set post-Boruta, con regla de selección por submuestra documentada.
-
----
-
-## Fase 4 — Backward Selection con XGBoost
-
-### Qué hace el método
-
-Selección **minimal-optimal** y **específica del modelo**: parte del conjunto de features supervivientes y **elimina iterativamente** la menos útil, midiendo el rendimiento en cada paso, hasta encontrar el subconjunto más pequeño que no degrada (o mejora) la métrica.
-
-Mecánica (eliminación hacia atrás, *greedy*):
-
-1. Empezar con todas las features candidatas. Calcular el **score por validación cruzada**.
-2. En cada paso, evaluar la eliminación de cada feature restante (o, más barato, eliminar la de menor importancia) y quedarse con la eliminación que **maximiza** el score CV.
-3. Repetir, registrando el score CV frente al nº de features.
-4. Elegir el subconjunto final según la curva.
-
-Aquí, a diferencia de las fases 2–3, se usan los **hiperparámetros reales del modelo final** (`min_child_weight=100`, `eta=0.01`, `n_estimators=200`, `max_depth=5`, etc.), porque esta fase debe reflejar el modelo que se desplegará.
-
-### Análisis crítico de overfitting — **el riesgo dominante de toda la cadena**
-
-Esta es la **única** fase donde "mirar overfitting entre train y validación" es exactamente la lente correcta, por dos problemas distintos:
-
-1. **Puntuar sobre train es inválido.** Quitar features casi nunca **empeora** el error de entrenamiento (la curva es monótona decreciente o plana en flexibilidad), así que un backward guiado por el score de train es ciego: elegiría siempre el conjunto completo o decisiones espurias. **Obligatorio usar score de validación cruzada.**
-
-2. **Optimismo por selección (el más sutil).** Backward prueba **muchos** subconjuntos y se queda con el mejor sobre la validación. Ese "mejor de muchos" **sobreajusta la propia estimación de validación**: el score CV del subconjunto ganador es optimista respecto a su rendimiento real.
-
-**Mitigaciones obligatorias:**
-- **CV con folds fijos** a lo largo de todos los pasos (mismos folds en cada eliminación → comparaciones justas).
-- **CV repetida** (varias semillas de partición) para estabilizar la decisión de qué eliminar.
-- **Regla 1-SE:** elegir el subconjunto **más pequeño** cuyo score CV esté **dentro de 1 error estándar** del mejor score, no el del mejor score absoluto. Esto contrarresta directamente el optimismo por selección y favorece parsimonia.
-- **Tocar el test una sola vez** al final, como estimación honesta. Nunca usarlo para guiar la eliminación.
-
-### Crítica al diseño
-
-- **Coste:** backward exhaustivo es `O(p²)` ajustes. Con el set ya reducido por las fases 1–3 es asumible. Si no, usar **eliminación por importancia** (quitar siempre la de menor SHAP) en vez de probar todas: mucho más barato, ligeramente menos óptimo.
-- `min_child_weight=100` con ≤ 10 000 filas es **muy agresivo**: cada hoja exige ≥ 100 muestras efectivas. Con `max_depth=5` (hasta 32 hojas) esto poda con fuerza. Es regularización fuerte, defendible en datos pequeños para evitar sobreajuste, **pero** durante backward puede ocultar la utilidad de features de señal débil. Recomendación: o se trata como hiperparámetro a tunear **después** de fijar features, o se relaja durante esta fase y se restaura en el modelo final.
-
-**Veredicto:** se mantiene, con CV repetida, folds fijos y **regla 1-SE** como salvaguardas no negociables.
+**Verdict:** keep, run cheaply on the post-Boruta set, with a documented per-subsample selection rule.
 
 ---
 
-## Fase 5 — *(Añadida)* Comprobación contra baseline
+## Phase 4 — Backward selection with XGBoost
 
-### Por qué añadirla
+### What the method does
 
-Tras 4 fases de decisiones tomadas sobre el **mismo** `df_train`, hay **optimismo acumulado**: cada fase eligió lo que parecía bueno en estos datos. Falta la evidencia más básica de que el esfuerzo sirvió.
+**Minimal-optimal** and **model-specific** selection: start from the surviving features and **iteratively remove** the least useful one, measuring performance at each step, until you reach the smallest subset that does not degrade (or improves) the metric.
 
-### Qué hace
+Mechanics (backward elimination, *greedy*):
 
-- Comparar, con la **misma CV** que la fase 4:
-  - score del **subconjunto final seleccionado**, vs.
-  - score usando **todas las features** (o el set post-Spearman).
-- Criterio de aceptación: el subconjunto final debe **igualar o mejorar** la generalización con **menos** variables. Si no lo hace, alguna fase fue demasiado agresiva → revisar (típicamente backward con `min_child_weight=100`).
-- *(Opcional)* Repetir todo el pipeline con varias semillas para medir la **estabilidad del conjunto seleccionado**. Si la lista de features cambia mucho entre semillas, la selección no es fiable.
+1. Start with all candidate features. Compute the **cross-validated score**.
+2. At each step, evaluate removing each remaining feature (or, more cheaply, remove the lowest-importance one) and keep the removal that **maximizes** the CV score.
+3. Repeat, recording the CV score against the number of features.
+4. Pick the final subset from the curve.
+
+Here, unlike phases 2–3, the **real hyperparameters of the final model** are used (`min_child_weight=100`, `eta=0.01`, `n_estimators=200`, `max_depth=5`, etc.), because this phase must reflect the model that will be deployed.
+
+### Family classification
+
+**Wrapper.** This is the canonical wrapper: an iterative search procedure (sequential backward selection, SBS / stepwise) that repeatedly supplies feature subsets to the model and uses the resulting performance estimate to guide the next removal. It is the most model-dependent and most expensive family.
+
+### Overfitting analysis — **the dominant risk of the whole chain**
+
+This is the **only** phase where "watching train vs. validation overfitting" is exactly the right lens, for two distinct problems:
+
+1. **Scoring on train is invalid.** Removing features almost never **worsens** the training error (the curve is monotonically decreasing or flat in flexibility), so a backward search guided by the train score is blind: it would always pick the full set or spurious decisions. **Cross-validated scoring is mandatory.**
+
+2. **Selection-induced optimism (the subtler one).** Backward tries **many** subsets and keeps the best on validation. That "best of many" **overfits the validation estimate itself**: the CV score of the winning subset is optimistic relative to its true performance.
+
+**Mandatory mitigations:**
+- **CV with fixed folds** across all steps (same folds at every removal → fair comparisons).
+- **Repeated CV** (several split seeds) to stabilize which feature to remove.
+- **1-SE rule:** pick the **smallest** subset whose CV score is **within 1 standard error** of the best score, not the absolute-best score. This directly counters selection-induced optimism and favors parsimony.
+- **Touch the test set only once** at the end, as an honest estimate. Never use it to guide removal.
+
+### Design critique
+
+- **Cost:** exhaustive backward is `O(p²)` fits. With the set already reduced by phases 1–3 it is affordable. If not, use **importance-based elimination** (always drop the lowest SHAP) instead of trying all: much cheaper, slightly less optimal.
+- `min_child_weight=100` with ≤ 10,000 rows is **very aggressive**: each leaf requires ≥ 100 effective samples. With `max_depth=5` (up to 32 leaves) this prunes hard. It is strong regularization, defensible on small data to avoid overfitting, **but** during backward it can mask the usefulness of weak-signal features. Recommendation: either treat it as a hyperparameter to tune **after** fixing features, or relax it during this phase and restore it in the final model.
+
+**Verdict:** keep, with repeated CV, fixed folds and the **1-SE rule** as non-negotiable safeguards.
 
 ---
 
-## Configuración recomendada del estimador
+## Phase 5 — *(Added)* Baseline check
+
+### Why add it
+
+After 4 phases of decisions taken on the **same** `df_train`, there is **accumulated optimism**: each phase picked what looked good on this data. The most basic evidence that the effort paid off is missing.
+
+### What it does
+
+- Compare, with the **same CV** as phase 4:
+  - the score of the **final selected subset**, vs.
+  - the score using **all features** (or the post-Spearman set).
+- Acceptance criterion: the final subset must **match or beat** generalization with **fewer** variables. If it does not, some phase was too aggressive → review (typically backward with `min_child_weight=100`).
+- *(Optional)* Re-run the whole pipeline with several seeds to measure the **stability of the selected set**. If the feature list changes a lot across seeds, the selection is not reliable.
+
+---
+
+## Recommended estimator configuration
 
 ```python
 from xgboost import XGBRegressor
 
-# Fases 2–3 (Boruta-SHAP, stability): barato y regularizado; aquí solo se RANKEA
+# Phases 2–3 (Boruta-SHAP, stability): cheap and regularized; here you only RANK
 xgb_fast = XGBRegressor(
     n_estimators=300,
     max_depth=5,
     tree_method="hist",
-    learning_rate=0.05,      # más alto que el final: no se afina, se ordena
+    learning_rate=0.05,      # higher than final: not tuning, just ranking
     subsample=0.8,
     colsample_bytree=0.8,
-    min_child_weight=20,     # más laxo que el 100 final: no podar señal débil aún
+    min_child_weight=20,     # laxer than the final 100: don't prune weak signal yet
     objective="reg:squarederror",
     random_state=SEED,
     n_jobs=-1,
 )
 
-# Fase 4 (backward) y modelo final: hiperparámetros REALES de despliegue
+# Phase 4 (backward) and final model: REAL deployment hyperparameters
 init_params = {
     "n_estimators": 200,
     "max_depth": 5,
@@ -221,41 +239,41 @@ init_params = {
     "eta": 0.01,
     "seed": SEED,
     "gamma": 0,
-    "min_child_weight": 100,  # revisar/tunear tras fijar features (ver Fase 4)
+    "min_child_weight": 100,  # review/tune after fixing features (see Phase 4)
 }
 ```
 
 ---
 
-## Diagnósticos y riesgos transversales
+## Cross-cutting diagnostics and risks
 
-- **Fuga de datos (leakage):** todas las fases, **Spearman incluida**, deben ejecutarse solo sobre `df_train`. Si más adelante hay CV externa para evaluar el *pipeline completo*, la selección debe ir **dentro** de cada fold de esa CV, no antes. Como aquí se trabaja "solo sobre `df_train`", el test externo permanece como estimación honesta y se toca una sola vez.
-- **Optimismo acumulado:** 4 decisiones data-dependientes sobre el mismo train → el test intacto es la única estimación no sesgada. No reutilizarlo.
-- **Spearman elimina redundancia, no irrelevancia:** no confundir su rol con el de Boruta.
-- **Boruta = all-relevant, Backward = minimal-optimal:** son objetivos distintos y complementarios; por eso la cadena tiene sentido.
-- **Estabilidad de la semilla:** con ≤ 10 000 filas, las importancias y selecciones pueden ser sensibles a la partición. Fijar `random_state` en todo y, si es posible, verificar estabilidad entre semillas.
+- **Data leakage:** all phases, **including Spearman**, must run only on `df_train`. If there is later an outer CV to evaluate the *full pipeline*, selection must go **inside** each fold of that CV, not before. Since here we work "only on `df_train`", the external test set remains an honest estimate and is touched only once.
+- **Accumulated optimism:** 4 data-dependent decisions on the same train → the untouched test is the only unbiased estimate. Do not reuse it.
+- **Spearman removes redundancy, not irrelevance:** do not confuse its role with Boruta's.
+- **Boruta = all-relevant, Backward = minimal-optimal:** distinct, complementary goals; that is why the chain makes sense.
+- **Seed stability:** with ≤ 10,000 rows, importances and selections can be sensitive to the split. Fix `random_state` everywhere and, if possible, verify stability across seeds.
 
-## Resumen de la crítica
+## Critique summary
 
-| Fase | Decisión | Motivo |
-|------|----------|--------|
-| 1 Spearman | **Mantener** | Su valor real es estabilizar 2–3, no decorrelacionar para el árbol. Tie-break informado. |
-| 2 Boruta-SHAP | **Mantener** | Control por shadows hace innecesario vigilar train/val. SHAP OOF opcional. |
-| 3 Stability | **Mantener (barata, post-Boruta)** | El remuestreo es el control de overfitting. Redundancia parcial con Boruta, pero aporta robustez. Definir regla de selección por submuestra. |
-| 4 Backward | **Mantener con salvaguardas** | **Único punto donde overfitting train/val es el riesgo central.** CV repetida + folds fijos + regla 1-SE. Revisar `min_child_weight=100`. |
-| 5 Baseline | **Añadir** | Evidencia de que la selección iguala/mejora con menos features. |
+| Phase | Family | Decision | Reason |
+|------|--------|----------|--------|
+| 1 Spearman | Filter | **Keep** | Its real value is stabilizing 2–3, not decorrelating for the tree. Informed tie-break. |
+| 2 Boruta-SHAP | Embedded | **Keep** | Shadow control makes watching train/val unnecessary. OOF SHAP optional. |
+| 3 Stability | Hybrid/iterative | **Keep (cheap, post-Boruta)** | Resampling is the overfitting control. Partial overlap with Boruta, but adds robustness. Define the per-subsample selection rule. |
+| 4 Backward | Wrapper | **Keep with safeguards** | **Only point where train/val overfitting is the central risk.** Repeated CV + fixed folds + 1-SE rule. Review `min_child_weight=100`. |
+| 5 Baseline | Validation | **Add** | Evidence that selection matches/beats with fewer features. |
 
-**LightGBM:** innecesario en todo el flujo. Con ≤ 10 000 filas la velocidad no es factor y mezclar estimadores introduce *selection–model mismatch*. Todo con XGBoost (`tree_method="hist"` en las fases baratas).
+**LightGBM:** unnecessary across the whole flow. With ≤ 10,000 rows speed is not a factor and mixing estimators introduces a *selection–model mismatch*. Everything with XGBoost (`tree_method="hist"` in the cheap phases).
 
 ---
 
-## Implementación de referencia (Python, funcional)
+## Reference implementation (Python, functional)
 
-Estilo procedural/funcional, sin OOP, funciones solo donde aportan. Dataset real de regresión (**California Housing**, integrado en scikit-learn, sin descarga externa), submuestreado a ≤ 10 000 filas para reflejar el contexto. `df` representa `df_train`: **todo se ejecuta solo sobre él**.
+Procedural/functional style, no OOP, functions only where they help. Real regression dataset (**California Housing**, built into scikit-learn, no external download), subsampled to ≤ 10,000 rows to match the context. `df` represents `df_train`: **everything runs only on it**.
 
-> Requiere `pip install xgboost shap scikit-learn scipy pandas numpy`. SHAP es obligatorio porque la fase 2 es Boruta-**SHAP** y la 3 usa importancia SHAP por coherencia.
+> Requires `pip install xgboost shap scikit-learn scipy pandas numpy`. SHAP is mandatory because phase 2 is Boruta-**SHAP** and phase 3 uses SHAP importance for consistency.
 
-### Setup, datos y estimadores
+### Setup, data and estimators
 
 ```python
 import numpy as np
@@ -268,14 +286,14 @@ import shap
 
 SEED = 42
 
-# Regresión real; submuestra a <=10k. 'df' = df_train (única fuente para selección).
+# Real regression; subsample to <=10k. 'df' = df_train (sole source for selection).
 df = fetch_california_housing(as_frame=True).frame.sample(8000, random_state=SEED).reset_index(drop=True)
 TARGET = "MedHouseVal"
 X, y = df.drop(columns=[TARGET]), df[TARGET]
 
 def make_fast_model():
-    # Fases 2-3: barato y REGULARIZADO. Aquí solo se rankea, no se afina ->
-    # learning_rate alto, subsample/colsample <1, min_child_weight laxo (no podar señal débil aún).
+    # Phases 2-3: cheap and REGULARIZED. Here we only rank, not tune ->
+    # high learning_rate, subsample/colsample <1, lax min_child_weight (don't prune weak signal yet).
     return XGBRegressor(
         n_estimators=300, max_depth=5, tree_method="hist", learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8, min_child_weight=20,
@@ -283,7 +301,7 @@ def make_fast_model():
     )
 
 def make_final_model():
-    # Fase 4 y modelo final: hiperparámetros REALES de despliegue.
+    # Phase 4 and final model: REAL deployment hyperparameters.
     return XGBRegressor(
         n_estimators=200, max_depth=5, subsample=1.0, colsample_bytree=1.0,
         objective="reg:squarederror", learning_rate=0.01, gamma=0,
@@ -291,60 +309,60 @@ def make_final_model():
     )
 
 def shap_importance(model, X):
-    # Importancia = media de |SHAP| por feature (más consistente que 'gain').
+    # Importance = mean |SHAP| per feature (more consistent than 'gain').
     sv = shap.TreeExplainer(model).shap_values(X)
     return pd.Series(np.abs(sv).mean(axis=0), index=X.columns)
 ```
 
-### Fase 1 — Spearman (umbral 0.85)
+### Phase 1 — Spearman (threshold 0.85)
 
-`threshold=0.85` alto: solo elimina redundancia casi-total. Tie-break **informado** (conserva la más correlada con el target), no aleatorio.
+`threshold=0.85` is high: it only removes near-total redundancy. **Informed** tie-break (keep the one more correlated with the target), not random.
 
 ```python
 def spearman_filter(X, y, threshold=0.85):
     corr = X.corr(method="spearman").abs()
-    tcorr = X.apply(lambda c: abs(spearmanr(c, y).statistic))  # |corr| con el target
+    tcorr = X.apply(lambda c: abs(spearmanr(c, y).statistic))  # |corr| with the target
     cols, drop = list(X.columns), set()
     for i in range(len(cols)):
         for j in range(i + 1, len(cols)):
             a, b = cols[i], cols[j]
             if a in drop or b in drop or corr.loc[a, b] < threshold:
                 continue
-            drop.add(a if tcorr[a] < tcorr[b] else b)  # descarta la menos útil del par
+            drop.add(a if tcorr[a] < tcorr[b] else b)  # drop the less useful of the pair
     return [c for c in cols if c not in drop]
 ```
 
-### Fase 2 — Boruta-SHAP
+### Phase 2 — Boruta-SHAP
 
-`n_iter=30` itera shadows para que el test binomial tenga potencia. Decisión por test binomial vs. `p=0.5`. Se guardan **Confirmadas + Tentativas** (colador ancho).
+`n_iter=30` iterates shadows so the binomial test has power. Decision via binomial test vs. `p=0.5`. Keep **Confirmed + Tentative** (wide sieve).
 
 ```python
 def boruta_shap(X, y, n_iter=30, alpha=0.05, seed=SEED):
     rng = np.random.default_rng(seed)
     hits = pd.Series(0, index=X.columns)
     for _ in range(n_iter):
-        # Shadow = copia permutada (ruido con misma marginal).
+        # Shadow = permuted copy (noise with the same marginal).
         shadow = X.apply(lambda c: rng.permutation(c.values)).add_prefix("shadow_")
         Xa = pd.concat([X.reset_index(drop=True), shadow], axis=1)
         imp = shap_importance(make_fast_model().fit(Xa, y), Xa)
-        smax = imp[shadow.columns].max()                  # techo de ruido
+        smax = imp[shadow.columns].max()                  # noise ceiling
         hits[X.columns] += (imp[X.columns] > smax).astype(int)
     def decide(h):
-        if binomtest(h, n_iter, 0.5, alternative="greater").pvalue < alpha: return "Confirmada"
-        if binomtest(h, n_iter, 0.5, alternative="less").pvalue   < alpha: return "Rechazada"
-        return "Tentativa"
+        if binomtest(h, n_iter, 0.5, alternative="greater").pvalue < alpha: return "Confirmed"
+        if binomtest(h, n_iter, 0.5, alternative="less").pvalue   < alpha: return "Rejected"
+        return "Tentative"
     status = hits.map(decide)
-    return status[status != "Rechazada"].index.tolist(), status
+    return status[status != "Rejected"].index.tolist(), status
 ```
 
-### Fase 3 — Stability selection (umbral 0.7)
+### Phase 3 — Stability selection (threshold 0.7)
 
-`n_subsamples=50`, `frac=0.5` (submuestreo sin reemplazo). `top_k` define la regla de selección por submuestra (las `q` más importantes). `thr=0.7` cumple `>0.5` exigido por la cota de falsos positivos.
+`n_subsamples=50`, `frac=0.5` (subsampling without replacement). `top_k` defines the per-subsample selection rule (the `q` most important). `thr=0.7` satisfies the `>0.5` required by the false-positive bound.
 
 ```python
 def stability_selection(X, y, n_subsamples=50, frac=0.5, top_k=None, thr=0.7, seed=SEED):
     rng = np.random.default_rng(seed)
-    top_k = top_k or max(1, X.shape[1] // 2)   # q: nº seleccionadas por submuestra
+    top_k = top_k or max(1, X.shape[1] // 2)   # q: features selected per subsample
     counts, n = pd.Series(0, index=X.columns), len(X)
     for _ in range(n_subsamples):
         idx = rng.choice(n, int(frac * n), replace=False)
@@ -355,33 +373,33 @@ def stability_selection(X, y, n_subsamples=50, frac=0.5, top_k=None, thr=0.7, se
     return freq[freq >= thr].index.tolist(), freq
 ```
 
-### Fase 4 — Backward selection (XGBoost) con CV repetida y regla 1-SE
+### Phase 4 — Backward selection (XGBoost) with repeated CV and 1-SE rule
 
-Eliminación **greedy por importancia** (`O(p)` ajustes, no `O(p²)`). **CV repetida con folds fijos** y **regla 1-SE** contra el optimismo por selección.
+**Greedy importance-based** elimination (`O(p)` fits, not `O(p²)`). **Repeated CV with fixed folds** and the **1-SE rule** against selection-induced optimism.
 
 ```python
 def backward_selection(X, y, min_features=1, seed=SEED):
-    cv = RepeatedKFold(n_splits=5, n_repeats=3, random_state=seed)  # folds fijos
+    cv = RepeatedKFold(n_splits=5, n_repeats=3, random_state=seed)  # fixed folds
     def cv_score(cols):
         s = cross_val_score(make_final_model(), X[cols], y, cv=cv,
                             scoring="neg_root_mean_squared_error")
-        return s.mean(), s.std() / np.sqrt(len(s))   # media y error estándar
+        return s.mean(), s.std() / np.sqrt(len(s))   # mean and standard error
     feats, history = list(X.columns), []
     while True:
         history.append((list(feats), *cv_score(feats)))
         if len(feats) == min_features:
             break
         imp = shap_importance(make_final_model().fit(X[feats], y), X[feats])
-        feats = [f for f in feats if f != imp.idxmin()]   # quita la menos importante
-    best = max(history, key=lambda h: h[1])               # neg_rmse: mayor es mejor
-    thr = best[1] - best[2]                                # dentro de 1 SE del mejor
+        feats = [f for f in feats if f != imp.idxmin()]   # drop the least important
+    best = max(history, key=lambda h: h[1])               # neg_rmse: higher is better
+    thr = best[1] - best[2]                                # within 1 SE of the best
     chosen = min((h for h in history if h[1] >= thr), key=lambda h: len(h[0]))
-    return chosen[0], history                              # subconjunto más parsimonioso
+    return chosen[0], history                              # most parsimonious subset
 ```
 
-### Fase 5 — Comprobación contra baseline
+### Phase 5 — Baseline check
 
-Evidencia de que la selección **iguala o mejora** con menos features (misma CV).
+Evidence that selection **matches or beats** with fewer features (same CV).
 
 ```python
 def baseline_check(X, y, selected, seed=SEED):
@@ -394,7 +412,7 @@ def baseline_check(X, y, selected, seed=SEED):
             "rmse_selected": rmse(selected),    "n_selected": len(selected)}
 ```
 
-### Orquestación (cadena: cada fase alimenta a la siguiente)
+### Orchestration (chain: each phase feeds the next)
 
 ```python
 f1 = spearman_filter(X, y, threshold=0.85)
@@ -403,12 +421,12 @@ f3, freq    = stability_selection(X[f2], y, thr=0.7)
 f4, history = backward_selection(X[f3], y)
 report      = baseline_check(X, y, f4)
 
-print("Fase 1 — Spearman      :", f1)
-print("Fase 2 — Boruta-SHAP   :", f2, "\n  status:", status.to_dict())
-print("Fase 3 — Stability     :", f3, "\n  freq  :", freq.round(2).to_dict())
-print("Fase 4 — Backward final:", f4)
-print("Fase 5 — Baseline      :", report)
-# Aceptar la selección solo si rmse_selected <= rmse_full (±SE) con menos features.
+print("Phase 1 — Spearman      :", f1)
+print("Phase 2 — Boruta-SHAP   :", f2, "\n  status:", status.to_dict())
+print("Phase 3 — Stability     :", f3, "\n  freq  :", freq.round(2).to_dict())
+print("Phase 4 — Backward final:", f4)
+print("Phase 5 — Baseline      :", report)
+# Accept the selection only if rmse_selected <= rmse_full (±SE) with fewer features.
 ```
 
-> **Nota:** California Housing tiene solo 8 features, por lo que el recorte será modesto — el código es **ilustrativo del flujo**. El valor del pipeline crece con la dimensionalidad. Para reproducibilidad, todo va con `random_state=SEED`; verifica estabilidad del conjunto seleccionado repitiendo con varias semillas si el problema lo justifica.
+> **Note:** California Housing has only 8 features, so the trimming will be modest — the code is **illustrative of the flow**. The pipeline's value grows with dimensionality. For reproducibility everything uses `random_state=SEED`; verify the selected set's stability by repeating with several seeds if the problem warrants it.
