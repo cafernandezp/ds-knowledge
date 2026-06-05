@@ -32,6 +32,61 @@ Decisiones a documentar: `objective`, `eval_metric`, backend de árboles, presup
 | `reg:logistic` | Salida **acotada a (0,1)** por sigmoide interna; pérdida logística penaliza más los bordes → mejor para proporciones; acepta `y` continuo en [0,1] | Optimiza la media logística, no MAE directamente (sesgo media-vs-mediana leve) | **Elegido** |
 | `reg:absoluteerror` | Optimiza **MAE (L1)** directamente → alineado con la métrica | **Pierde la cota [0,1]**; hessiano constante → árboles menos estables / convergencia más lenta | Reservado como comparación empírica futura |
 
+#### 2.1.1 Justificación detallada de `reg:logistic`
+
+La elección no es solo "acota a [0,1]". Hay cuatro razones técnicas que se refuerzan entre sí; conviene documentarlas porque la alternativa intuitiva (`reg:squarederror`) parece más simple pero es estadísticamente inadecuada para un target que es una **proporción**.
+
+**(a) Naturaleza del target: es una proporción, no una cantidad libre.**
+`score` mide la fracción de avance de un procedimiento. Vive en el intervalo cerrado [0,1] por definición del fenómeno, no por una restricción artificial. Un modelo cuyo espacio de salida es ℝ (como `reg:squarederror`) está **mal especificado**: asigna densidad/predicción a regiones imposibles (un avance de −5 % o de 112 % no existe). `reg:logistic` modela el **logit** del avance y devuelve la proporción vía sigmoide, de modo que el espacio de salida coincide con el espacio del fenómeno.
+
+**(b) Mecánica interna: dónde entra la cota.**
+XGBoost construye un *score crudo* aditivo `F(x) = Σ fₖ(x)` (suma de hojas), que es **no acotado**. La diferencia entre objetivos es la función de enlace aplicada a `F(x)`:
+
+- `reg:squarederror`: predicción = `F(x)` directamente → puede ser cualquier real.
+- `reg:logistic`: predicción = `σ(F(x)) = 1 / (1 + e^(−F(x)))` → **siempre en (0,1)** por construcción matemática, sin post-proceso ni clipping. La cota es estructural, no un parche.
+
+**(c) Estructura del error: la varianza de una proporción no es constante.**
+`reg:squarederror` minimiza MSE, que asume **homocedasticidad** (misma varianza del error en todo el rango). Para una proporción esto es falso: la varianza es máxima cerca de 0.5 y **se contrae hacia 0 en los extremos** (un avance del 99 % deja muy poco margen de error posible), análogo a la varianza binomial `p(1−p)`. La pérdida logística (entropía cruzada) que usa `reg:logistic` **pondera el error de forma coherente con esa estructura**: penaliza más los fallos cerca de los bordes y menos en el centro. Resultado: predicciones mejor calibradas a lo largo de todo el rango de avance, no solo en la media.
+
+**(d) Qué pierde `reg:squarederror` en la práctica.**
+- Sesgo sistemático en las colas: tiende a predecir < 0 para casos casi sin avance y > 1 para casos casi completos, justo los extremos que suelen importar (¿está parado? ¿está terminado?).
+- Si se "arregla" con clipping a [0,1], se introduce un sesgo no modelado y se acumula masa artificial en 0 y 1.
+- Trata por igual un error en la zona estable (centro) y en la zona de varianza contraída (bordes), degradando la calibración.
+
+**Por qué `reg:logistic` y no la opción "estadísticamente pura" (regresión beta).**
+El modelo formalmente correcto para una proporción continua en (0,1) es la **regresión beta**, que modela explícitamente media y dispersión. Se descarta porque: (i) XGBoost **no la trae como objetivo nativo**; (ii) la beta está definida en el intervalo **abierto** (0,1) y **rompe con 0.0 y 1.0 exactos**, que aquí existen (procedimientos sin iniciar o completados); (iii) requeriría transformaciones (p. ej. squeeze de Smithson-Verkuilen) que añaden complejidad y supuestos. `reg:logistic` captura el 90 % del beneficio (cota + ponderación tipo binomial del error) **tolerando 0.0 y 1.0 exactos** y sin salir del ecosistema XGBoost. Es el punto pragmático correcto.
+
+**Coste asumido — desajuste objetivo ↔ métrica.**
+`reg:logistic` optimiza la **media** bajo pérdida logística; MAE corresponde a optimizar la **mediana** (L1). Hay, por tanto, un pequeño desalineamiento entre lo que el objetivo minimiza y la métrica que reportamos. Se asume conscientemente porque (i) el sesgo media-vs-mediana es leve cuando la distribución condicional no es fuertemente asimétrica, y (ii) la **cota física [0,1]** aporta más valor que cerrar ese desajuste. La alternativa que lo cierra (`reg:absoluteerror`) sacrifica la cota; ver §2.1 y la acción futura en §3.
+
+**Validación esperada (cómo se confirma la decisión).**
+- Histograma de predicciones: con `reg:logistic` **ninguna** cae fuera de [0,1]; con `reg:squarederror` aparecen colas fuera de rango.
+- Calibración por tramos de avance (predicho vs observado en bins): `reg:logistic` debe mantener el sesgo bajo también en los extremos.
+- MAE medido en escala original vía `scoring`, no la log-loss interna.
+
+#### 2.1.2 Por qué NO `reg:absoluteerror` (aun estando alineado con MAE)
+
+`reg:absoluteerror` optimiza L1, es decir **exactamente** la métrica de reporte. Es la objeción más razonable a `reg:logistic`. Aun así se descarta, y el argumento **no es la velocidad** (hay cómputo de sobra). Son tres razones de fondo, más un matiz sobre el optimizador:
+
+**(1) Rompe la cota [0,1] — estructural.**
+`reg:absoluteerror` **no aplica función de enlace**: la predicción es el score crudo aditivo `F(x) = Σ fₖ(x)`, que vive en ℝ → puede devolver −0.08 o 1.06. Esto reintroduce justo el problema que `reg:logistic` resuelve. El parche (clipping a [0,1]) añade sesgo no modelado y acumula masa artificial en los bordes.
+
+**(2) L1 optimiza la *mediana* condicional — mal estimador para una proporción con masa en los bordes.**
+Minimizar L1 ⇒ el modelo predice la **mediana** de `y|x`; minimizar log-loss/L2 ⇒ la **media**. Con un target que probablemente tiene **masa en 0.0 (sin iniciar) y 1.0 (completado)**, la mediana se degenera:
+- Si en una región del espacio de features > 50 % de los casos están en `1.0`, la **mediana predicha es exactamente 1.0**, *ignorando la dispersión del resto*.
+- Efecto: predicciones que **se pegan a 0 y 1 en bloques**, vaciando la gradación intermedia — que suele ser la población de interés (los casos *a medio camino*).
+- La **media** (`reg:logistic`) conserva información de toda la distribución condicional y produce estimaciones suaves en el interior → mejor discriminación entre casos intermedios.
+
+**(3) "Alineado con la métrica" ≠ "menor MAE en test".**
+La alineación es sobre la **pérdida de entrenamiento**, no sobre el MAE **out-of-sample**, que depende de sesgo-varianza y calibración. Un estimador de la media bien calibrado (`reg:logistic`), *medido con MAE*, puede lograr **menor MAE en test** que un estimador de la mediana que se degenera en los bordes o sobreajusta la estructura mediana del train. El supuesto "si optimizo MAE tendré el mejor MAE" es **falso en general** fuera de muestra; solo se cumpliría si la mediana condicional fuese el mejor predictor, que aquí no lo es por el punto (2).
+
+**Matiz sobre el hessiano (calidad de ajuste, NO velocidad).**
+XGBoost es un optimizador de **segundo orden**: usa gradiente y **hessiano** para elegir splits (`gain = G²/(H+λ)`) y pesos de hoja. Para L1 el gradiente es `sign(pred − y) ∈ {−1,+1}` y el **hessiano es 0**; XGBoost lo compensa con hessiano constante y recálculo de hojas por mediana de residuos. Consecuencias **independientes del cómputo**:
+- La fórmula de ganancia de split **degenera** (sin curvatura) → cortes peor informados.
+- **`reg_lambda` / `min_child_weight` se comportan distinto** (L2 sumada a `H≈0`) → los knobs de regularización del §2.4 dejan de ser comparables y predecibles. Más cómputo no lo arregla: ajusta un modelo distinto y peor informado, no uno que "converge lento".
+
+**Conclusión.** El beneficio de `reg:absoluteerror` (alinear *training loss* con la métrica) **no domina** frente a perder la cota física, inducir un estimador-mediana degenerado en los bordes, y desestabilizar la regularización. Dado que la velocidad no limita, la postura correcta no es decidir por teoría sino **confirmarla con un bake-off** (ver acción en §3).
+
 ### 2.2 Métrica de evaluación (`eval_metric`)
 
 - Sin `eval_set` + `early_stopping_rounds`, `eval_metric` es **cosmético**: solo se reporta, **no afecta el entrenamiento** (no toca gradientes ni corta iteraciones).
@@ -51,12 +106,12 @@ Decisiones a documentar: `objective`, `eval_metric`, backend de árboles, presup
 
 ## 3. Decisión (conclusión)
 
-- **`objective = reg:logistic`** — la cota física [0,1] del target pesa más que la alineación exacta con MAE; el sesgo media-vs-mediana es leve y tolerable.
+- **`objective = reg:logistic`** — el target es una **proporción** en [0,1]: el objetivo modela el logit y devuelve la salida vía sigmoide, garantizando la cota **por construcción** y ponderando el error de forma coherente con la varianza tipo binomial de una proporción (mayor en el centro, contraída en los bordes). Se prefiere sobre `reg:squarederror` (mal especificado: salida en ℝ, homocedástico) y sobre la regresión beta (no nativa en XGBoost y rota en 0.0/1.0 exactos). La cota física pesa más que la alineación exacta con MAE; el sesgo media-vs-mediana es leve y tolerable. Justificación completa en §2.1.1.
 - **MAE se gestiona en la CV** (`scoring="neg_mean_absolute_error"`), no en el objetivo ni en `eval_metric`.
 - **`tree_method="hist"` + `enable_categorical=True`** — rapidez y soporte nativo de categóricas de alta cardinalidad sin one-hot.
 - **Presupuesto fijo** `n_estimators=600`, `learning_rate=0.03` (sin early stopping en el base).
 - **Regularización conservadora** como referencia estable del flujo de selección.
-- **Pendiente / acción futura:** comparar empíricamente contra `objective="reg:absoluteerror"` con el mismo `scoring`; si el MAE mejora de forma estable y el clipping de rango no molesta, reconsiderar el objetivo. El esquema de CV (estratificación / agrupamiento) se refina por separado.
+- **Pendiente / acción futura — bake-off `reg:logistic` vs `reg:absoluteerror`:** como la velocidad no limita, confirmar empíricamente la decisión en lugar de cerrarla solo por teoría. Entrenar ambos con el **mismo `scoring="neg_mean_absolute_error"`** y la misma CV, y comparar en **tres ejes**: (1) **MAE en test externo**; (2) **% de predicciones fuera de [0,1]** en `reg:absoluteerror` y sesgo introducido por el clipping; (3) **calibración por tramos** y **masa pegada a 0/1** (histograma de predicciones). Regla: adoptar `reg:absoluteerror` **solo si** mejora el MAE de test de forma **estable entre repeats** *y* el comportamiento en bordes es aceptable; en empate o con bordes degenerados → mantener `reg:logistic`. El esquema de CV se refina por separado.
 
 ---
 
