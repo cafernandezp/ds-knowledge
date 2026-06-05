@@ -65,9 +65,26 @@ Condicionantes del problema:
 
 - Compensación obligatoria: el **número final insesgado** sale del **test externo intocado**, no de esta CV.
 
-### 2.5 Métrica (`scoring`)
+### 2.5 Métrica (`scoring`) — por qué `neg_mean_absolute_error` y no `mean_absolute_error`
 
-- `neg_mean_absolute_error` — MAE es la métrica de negocio; negativo por la convención de sklearn ("mayor = mejor"). Se recupera el MAE real con `-res["test_score"]`.
+**No es un cálculo distinto: es el MAE con el signo invertido por la convención de scoring de scikit-learn.**
+
+- scikit-learn impone que **todos los objetos `scorer` siguen la regla "mayor = mejor"** (higher return values are better). Las herramientas que consumen `scoring` (`cross_validate`, `GridSearchCV`, `RandomizedSearchCV`…) están escritas para **maximizar**.
+- El MAE es un **error**: menor es mejor. Eso **viola** la convención "mayor = mejor".
+- sklearn lo resuelve **negándolo**: `neg_MAE = −MAE`. Así `MAE=0.08 → −0.08`, y como `−0.08 > −0.12`, "menos error" pasa a ser "score más alto" → ya cumple la regla y las utilidades que maximizan eligen automáticamente el menor MAE **sin lógica especial**.
+- Regla mnemónica de la API: los scorers que terminan en `_score` se **maximizan** (más alto mejor); los que miden error/pérdida se exponen con prefijo **`neg_`** y devuelven el valor negado.
+- **No existe** un `scoring="mean_absolute_error"` (sin `neg_`) como string predefinido; usar `mean_absolute_error` directamente solo es válido vía la **función** del módulo `sklearn.metrics` (fuera del flujo de `scoring`), o construyendo un scorer con `make_scorer(mean_absolute_error, greater_is_better=False)` — que internamente **vuelve a negar** el valor.
+
+**Consecuencia práctica (lo único que hay que recordar):** `cross_validate` devuelve el score **en negativo** → para reportar el MAE real se le antepone el signo:
+
+```python
+mae = -res["test_score"]      # recupera el MAE en su escala positiva
+m   = mae.mean()              # MAE medio interpretable
+```
+
+> Matiz: el `scoring` (negativo, para *seleccionar/comparar*) y la **función** `metrics.mean_absolute_error` (positiva, para *reportar* sobre el test externo) conviven sin contradicción — son el mismo número con distinto signo según el contexto de uso.
+
+**Referencia fiable:** scikit-learn — *Metrics and scoring: quantifying the quality of predictions*, sección "The scoring parameter". La documentación afirma que todos los objetos scorer siguen la convención de que valores de retorno más altos son mejores que los más bajos, por lo que métricas que miden la distancia entre el modelo y los datos (como el error cuadrático medio) se exponen como versiones `neg_` que devuelven el valor negado. URL: https://scikit-learn.org/stable/modules/model_evaluation.html
 
 ---
 
@@ -150,3 +167,11 @@ final_mae = mean_absolute_error(
   - Si se combina `qcut(y)` con categóricas, vigilar **estratos con < k muestras**; colapsar niveles raros en `"Other"` si aparecen.
   - El test externo debe permanecer **cerrado** hasta la evaluación final única.
 - **Pendiente:** confirmar si `tipo_procedimiento` entra en la clave de estratificación tras el diagnóstico de cardinalidad; revisar `k=4` vs `k=5` comparando la media de MAE entre ambos.
+
+---
+
+## 6. Referencias
+
+1. scikit-learn — *Metrics and scoring: quantifying the quality of predictions* (sección "The scoring parameter"); convención "mayor = mejor" y métricas `neg_`. https://scikit-learn.org/stable/modules/model_evaluation.html
+2. scikit-learn — `RepeatedStratifiedKFold`, `cross_validate` (API Reference). https://scikit-learn.org/stable/modules/classes.html
+3. scikit-learn — *Cross-validation: evaluating estimator performance* (User Guide). https://scikit-learn.org/stable/modules/cross_validation.html
