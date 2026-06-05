@@ -14,6 +14,13 @@
 # Brownfield project
 
 
-# Preferred tech stack
+# Preferred tech stack for data science
 - Python
+- FastAPI
+- uv: pavkage manager
+- ruff: code formatter
+- docker
+- pytest: testing code
+- click: command line tool
+- 
 
