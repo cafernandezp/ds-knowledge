@@ -6,12 +6,14 @@
  Step 1: Configure development environment
 
 * Configure Github Codespaces or the equivalent
-* Create scaffold for steucture of project: 'Makefile' 'requirements'
+* Create scaffold for structure of project: 'Makefile' 'requirements'
 * Optional (setup virtualenv) ipython outside of requirements.txt)
 
 
 
 # Brownfield project
+
+
 
 
 # Preferred tech stack for data science
@@ -24,4 +26,10 @@
 - click: command line tool
 - mlflow: model and experiment versioning
 - Pydantic: To force data types
+- Makefile: File with instructions for install, lint, format, refactor (format + lint)
+
+
+
+# Preferred project structure
+
 
