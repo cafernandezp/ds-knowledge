@@ -23,5 +23,5 @@
 - pytest: testing code
 - click: command line tool
 - mlflow: model and experiment versioning
-- 
+- Pydantic: To force data types
 
