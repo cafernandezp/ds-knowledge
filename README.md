@@ -55,3 +55,18 @@
 4. Evaluation of inference population
 5. Deployment
 
+
+# Any Decision Record
+
+Folder docs/
+
+# Memory
+
+
+Folder docs/
+
+
+# Plans
+
+Folder docs/
+
