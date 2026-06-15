@@ -60,6 +60,9 @@
 
 Folder docs/
 
+skill: use skill create-adr
+
+
 # Memory
 
 
