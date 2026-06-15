@@ -17,9 +17,9 @@
 
 
 # Preferred tech stack for data science
-- Python
+- Python 3
 - FastAPI
-- uv: pavkage manager
+- uv: package manager
 - ruff: code formatter
 - docker
 - pytest: testing code
@@ -31,8 +31,10 @@
 
 
 # Preferred behavior in coding
-- Use always relative paths instead of absolute paths for importing modules, reading  data, configs or parameter files.
-- Avoid overengineering with object oriented programming methodology, try to keep it simple with the minimum amount of functions.
+-Paths:  Use always relative paths instead of absolute paths for importing modules, reading  data, configs or parameter files.
+-OOP vs functional: Avoid overengineering with object oriented programming methodology, try to keep it simple with the minimum amount of functions.
+- Writing data: When we need to write datasets, parquet format is prefered vs csv or other format files
+- Writing functions: Always add explicit arguments when calling a function (keyword naming, not postional only)
 
 
 
