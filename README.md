@@ -36,7 +36,11 @@
 - Writing data: When we need to write datasets, parquet format is prefered vs csv or other format files
 - Writing functions: Always add explicit arguments when calling a function (keyword naming, not postional only)
 
-
+# Tests
+1. Unit tests
+2. Integration tests
+3. Complete tests
+4. Data tests
 
 
 # Preferred project structure
@@ -45,3 +49,8 @@
 
 # Workflow for machine learning projects
 
+1. Exploration
+2. ETL: Creating the joins and modification of data with the goal of create the training dstaset
+3. Modelling
+4. Evaluation of inference population
+5. Deployment
