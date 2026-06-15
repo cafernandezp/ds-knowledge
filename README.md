@@ -27,9 +27,19 @@
 - mlflow: model and experiment versioning
 - Pydantic: To force data types
 - Makefile: File with instructions for install, lint, format, refactor (format + lint)
+- logging: For creating logs instead of prints
+
+
+# Preferred behavior in coding
+- Use always relative paths instead of absolute paths for importing modules, reading  data, configs or parameter files.
+- Avoid overengineering with object oriented programming methodology, try to keep it simple with the minimum amount of functions.
+
 
 
 
 # Preferred project structure
 
+
+
+# Workflow for machine learning projects
 
