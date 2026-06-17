@@ -66,8 +66,8 @@ Developing format: code in folder of the same name of the project. Example: <rep
 1. ETL Train: Refactor of the code created in the developing phase to have a reproducible pipeline for the creation of the training/test dataset. Necessary to have an updated sample if needed based on a reference date and for future retraining processses.
 2. ETL Inference: Creation of the inference population that is needed for model inference periodically.
 
-Example of the 
-´´´
+Example of the <repo_name>/<repo_name>/ folder for the project "cbrzetlcappagoii":
+```text
 ├── cbrzetlcappagoii
 │   ├── __init__.py
 │   ├── app.py
@@ -106,7 +106,7 @@ Example of the
 │       ├── func_quota.py
 │       ├── toml_read.py
 │       └── utils.py
-´´´
+```
 
 ## Specific observations for both phases**
 - ETL's stages are typically developed in PySpark
