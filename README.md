@@ -52,7 +52,7 @@ Leave this part for the phase "Production". Not mandatory for other phases of th
 
 # Phases in machine learning projects
 
-**Developing Phase**
+## Developing Phase
 Developing format: Mainly in jupyter notebooks in the folder "notebooks/"
 1. Exploration and data analysis
 2. ETL Perimetro: Creating the joins and modification of data with the goal of create the sample for model training with typical id columns (reference date, id customer or id contract, segments, others)
@@ -61,14 +61,58 @@ Developing format: Mainly in jupyter notebooks in the folder "notebooks/"
 5. Modelling: feature analysis (univariate, bivariate), feature selection (drift, multivariate, hyperoptimization), 
 6. Model performance evaluation
 
-**Production Phase**
+## Production Phase
 Developing format: code in folder of the same name of the project. Example: <repo_name>/<repo_name>/
 1. ETL Train: Refactor of the code created in the developing phase to have a reproducible pipeline for the creation of the training/test dataset. Necessary to have an updated sample if needed based on a reference date and for future retraining processses.
 2. ETL Inference: Creation of the inference population that is needed for model inference periodically.
 
-**Specific observations for both phases**
+Example of the 
+´´´
+├── cbrzetlcappagoii
+│   ├── __init__.py
+│   ├── app.py
+│   ├── conf
+│   │   ├── __init__.py
+│   │   ├── feature_encoding.toml
+│   │   ├── feature_imputing.toml
+│   │   ├── mapping_clientization.py
+│   │   ├── mapping_cnae.toml
+│   │   ├── mapping_collective.py
+│   │   ├── mapping_ine.py
+│   │   ├── mapping_sociodemo.py
+│   │   └── mapping.py
+│   ├── config.py
+│   ├── producer
+│   │   ├── __init__.py
+│   │   ├── etl_cappagoii.py
+│   │   └── intermedian
+│   │       ├── __init__.py
+│   │       ├── categorization.py
+│   │       ├── expenses.py
+│   │       ├── hermes.py
+│   │       ├── incomes.py
+│   │       ├── ine.py
+│   │       ├── perimeter.py
+│   │       ├── preprocessing.py
+│   │       ├── quota.py
+│   │       └── sociodemo.py
+│   ├── run_pyspark.py
+│   ├── tables
+│   │   ├── __init__.py
+│   │   └── tables_config.py
+│   └── utils
+│       ├── __init__.py
+│       ├── checks_dates.py
+│       ├── func_quota.py
+│       ├── toml_read.py
+│       └── utils.py
+´´´
+
+## Specific observations for both phases**
 - ETL's stages are typically developed in PySpark
 - Rest of the phases are typically developed in python
+
+
 
 
 # Any Decision Record
